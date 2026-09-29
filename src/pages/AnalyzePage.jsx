@@ -1,13 +1,16 @@
 import { useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { categorizeMessage } from '../utils/llmHelper'
-import { calculateUrgency } from '../utils/urgencyScorer'
-import { getRecommendedAction } from '../utils/templates'
+import { triageMessage } from '../utils/llmHelper'
+import { getRecommendedAction, shouldEscalate } from '../utils/templates'
+
+const MIN_MESSAGE_LENGTH = 10
+const MAX_MESSAGE_LENGTH = 5000
 
 function AnalyzePage() {
   const [message, setMessage] = useState('')
   const [results, setResults] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [inputError, setInputError] = useState('')
 
   useEffect(() => {
     // Check for example message from home page
@@ -19,30 +22,35 @@ function AnalyzePage() {
   }, [])
 
   const handleAnalyze = async () => {
-    if (!message.trim()) {
-      alert('Please enter a message to analyze')
+    const text = message.trim()
+    if (text.length < MIN_MESSAGE_LENGTH) {
+      setInputError(`Add a bit more detail (at least ${MIN_MESSAGE_LENGTH} characters) so the message can be triaged.`)
       return
     }
+    if (text.length > MAX_MESSAGE_LENGTH) {
+      setInputError(`Messages are limited to ${MAX_MESSAGE_LENGTH} characters.`)
+      return
+    }
+    setInputError('')
 
     setIsLoading(true)
     setResults(null)
-    
+
     try {
-      // Run categorization (LLM call)
-      const { category, reasoning } = await categorizeMessage(message)
-      
-      // Calculate urgency (rule-based)
-      const urgency = calculateUrgency(message)
-      
-      // Get recommended action (template-based)
-      const recommendedAction = getRecommendedAction(category)
-      
+      // AI category and urgency, with deterministic safety rules and a visible fallback
+      const triage = await triageMessage(text)
+
       const analysisResult = {
-        message,
-        category,
-        urgency,
-        recommendedAction,
-        reasoning,
+        message: text,
+        category: triage.category,
+        urgency: triage.urgency,
+        recommendedAction: getRecommendedAction(triage.category, triage.urgency),
+        escalate: shouldEscalate(triage.category, triage.urgency),
+        reasoning: triage.reasoning,
+        source: triage.source,
+        model: triage.model,
+        notice: triage.notice,
+        urgencyReasons: triage.urgencyReasons,
         timestamp: new Date().toISOString()
       }
 
@@ -63,6 +71,7 @@ function AnalyzePage() {
   const handleClear = () => {
     setMessage('')
     setResults(null)
+    setInputError('')
   }
 
   return (
@@ -80,15 +89,21 @@ function AnalyzePage() {
               Customer Message
             </label>
             <textarea
+              id="customer-message"
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               placeholder="Paste customer message here..."
               className="w-full border border-gray-300 rounded-lg p-3 h-40 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               disabled={isLoading}
+              aria-invalid={inputError ? 'true' : undefined}
+              aria-describedby="message-help"
             />
-            <div className="text-sm text-gray-500 mt-1">
+            <div id="message-help" className="text-sm text-gray-500 mt-1">
               {message.length} characters
             </div>
+            {inputError && (
+              <p role="alert" className="text-sm text-red-700 mt-1">{inputError}</p>
+            )}
           </div>
 
           {/* Action Buttons */}
@@ -128,7 +143,19 @@ function AnalyzePage() {
         {results && (
           <div className="bg-white rounded-lg shadow-md p-6">
             <h2 className="text-xl font-bold text-gray-900 mb-4">Analysis Results</h2>
-            
+
+            <p className="text-sm text-gray-600 mb-3">
+              Source:{' '}
+              <span className={`font-semibold ${results.source === 'ai' ? 'text-blue-700' : 'text-orange-700'}`}>
+                {results.source === 'ai' ? `AI (${results.model})` : 'Rule-based fallback'}
+              </span>
+            </p>
+            {results.notice && (
+              <div role="status" className="bg-orange-50 border border-orange-200 text-orange-900 rounded-lg p-3 mb-4 text-sm">
+                {results.notice}
+              </div>
+            )}
+
             <div className="space-y-4">
               <div>
                 <div className="text-sm font-semibold text-gray-600 mb-1">Category</div>
@@ -146,6 +173,14 @@ function AnalyzePage() {
                 }`}>
                   {results.urgency}
                 </div>
+                {results.escalate && (
+                  <span className="inline-block ml-2 px-3 py-2 rounded-lg font-semibold bg-red-600 text-white">
+                    Escalate to a lead
+                  </span>
+                )}
+                {results.urgencyReasons?.length > 0 && (
+                  <p className="text-sm text-gray-500 mt-1">Signals: {results.urgencyReasons.join(', ')}</p>
+                )}
               </div>
 
               <div>
@@ -156,7 +191,9 @@ function AnalyzePage() {
               </div>
 
               <div>
-                <div className="text-sm font-semibold text-gray-600 mb-1">AI Reasoning</div>
+                <div className="text-sm font-semibold text-gray-600 mb-1">
+                  {results.source === 'ai' ? 'AI Reasoning' : 'Reasoning'}
+                </div>
                 <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
                   <div className="prose prose-sm max-w-none text-gray-700">
                     <ReactMarkdown>
@@ -170,7 +207,7 @@ function AnalyzePage() {
             <div className="mt-6 pt-4 border-t border-gray-200">
               <button
                 onClick={() => {
-                  const text = `Category: ${results.category}\nUrgency: ${results.urgency}\nRecommendation: ${results.recommendedAction}\n\nReasoning: ${results.reasoning}`
+                  const text = `Category: ${results.category}\nUrgency: ${results.urgency}${results.escalate ? ' (escalate)' : ''}\nRecommendation: ${results.recommendedAction}\nSource: ${results.source === 'ai' ? `AI (${results.model})` : 'rule-based fallback'}\n\nReasoning: ${results.reasoning}`
                   navigator.clipboard.writeText(text)
                   alert('Results copied to clipboard!')
                 }}
